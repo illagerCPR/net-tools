@@ -62,6 +62,22 @@ pnpm build
 - **CSS 主题**：`data-theme` 在 `<head>` 内联脚本里先落定，避免首屏闪烁；`:root[data-theme="light"] .btn:not(.btn--ghost)` 控制浅色下按钮文字对比度。
 - **依赖构建脚本**：pnpm 11 把 `onlyBuiltDependencies` 移到 `pnpm-workspace.yaml` 的 `allowBuilds`，否则 `pnpm exec` 会因为「Ignored build scripts」直接失败。
 
+## 自动部署（GitHub Actions）
+
+无头环境下比 Pages 的 Git 集成更省事，而且直传项目也能用：
+
+1. 仓库 Settings → Secrets and variables → Actions，添加：
+   - `CLOUDFLARE_API_TOKEN`：Account → Cloudflare Pages → Edit
+   - `CLOUDFLARE_ACCOUNT_ID`
+2. `.github/workflows/deploy.yml` 会在每次 push 到 `main` 时跑 test → check → build → `wrangler pages deploy dist`。
+3. 也可以在 Actions 页面手动 `workflow_dispatch`。
+
+注意：Pages 的 Git 集成项目无法转成直传项目，直传项目也无法后接 Git；想用 Git 集成必须新建项目。用 Actions 则不受这一限制。
+
+## 证书数据源
+
+`/api/cert` 默认查 Cert Spotter（快，1–2 秒，免费额度约 100 次/小时），失败才回退 crt.sh。crt.sh 在证书量大的域名上经常需要 13–50 秒，甚至直接返回 502，因此只作兜底。若流量上来，在 Pages 里配置 `CERTSPOTTER_TOKEN` 可提升额度（10k/小时），配上后请求会带 `Authorization: Bearer`。
+
 ## 部署注意
 
 - `wrangler.toml` 里 `pages_build_output_dir = "dist"`，直接 `wrangler pages deploy` 即可。

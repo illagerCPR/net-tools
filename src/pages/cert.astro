@@ -21,7 +21,10 @@ import Layout from "../layouts/Layout.astro";
   <p class="status-line" id="cert-status" style="margin-top: 12px">输入域名开始查询。</p>
   <div id="cert-results" style="margin-top: 12px"></div>
 
-  <p class="note note--warn" style="margin-top: 20px">
+  <p class="note" style="margin-top: 20px">
+    默认走 Cert Spotter 的 CT 接口（通常 1–2 秒）；失败时回退到 crt.sh——后者在证书量大的域名上经常要十几秒甚至返回 502，属于上游本身的问题。
+  </p>
+  <p class="note note--warn" style="margin-top: 12px">
     如果域名从未使用过公开 CA 证书（例如只在内网使用自签证书），这里会查不到结果。CT 日志通常有几分钟到数小时的延迟。
   </p>
 </Layout>
@@ -35,6 +38,17 @@ import Layout from "../layouts/Layout.astro";
   const statusLine = must("#cert-status");
   const results = must("#cert-results");
 
+  function errorPanel(message: string, hint?: string | null, manualUrl?: string): string {
+    return `
+      <div class="card">
+        <div class="card-title"><h3>查询失败</h3></div>
+        <p class="small">${esc(message)}</p>
+        ${hint ? `<p class="small muted" style="margin-top: 8px">${esc(hint)}</p>` : ""}
+        ${manualUrl ? `<p style="margin-top: 12px"><a href="${esc(manualUrl)}" rel="noopener">在 crt.sh 手动查看 →</a></p>` : ""}
+      </div>
+    `;
+  }
+
   function render(data: CertResponse): void {
     const certificates = data.certificates ?? [];
     if (certificates.length === 0) {
@@ -45,19 +59,21 @@ import Layout from "../layouts/Layout.astro";
 
     const rows = certificates
       .map((certificate) => {
-        const state =
-          certificate.expired === null
+        const state = certificate.revoked
+          ? '<span class="badge badge--bad">已吊销</span>'
+          : certificate.expired === null
             ? '<span class="badge">未知</span>'
             : certificate.expired
               ? '<span class="badge badge--bad">已过期</span>'
               : '<span class="badge badge--ok">有效期内</span>';
+        const fingerprint = certificate.fingerprint ? `${certificate.fingerprint.slice(0, 20)}…` : "—";
         return `
           <tr>
             <td class="mono">${esc(certificate.commonName ?? "—")}</td>
             <td class="small">${esc(certificate.issuer ?? "—")}</td>
             <td class="mono small">${esc(fmtDate(certificate.notBefore))}<br>${esc(fmtDate(certificate.notAfter))}</td>
             <td>${state}</td>
-            <td class="mono small muted">${esc(certificate.serialNumber ?? "—")}</td>
+            <td class="mono small muted" title="${esc(certificate.fingerprint ?? "")}">${esc(fingerprint)}</td>
           </tr>
         `;
       })
@@ -67,11 +83,14 @@ import Layout from "../layouts/Layout.astro";
     results.innerHTML = `
       <div class="table-wrap">
         <table class="data">
-          <thead><tr><th style="width: 190px">证书名</th><th>颁发者</th><th style="width: 170px">有效期</th><th style="width: 96px">状态</th><th style="width: 170px">序列号</th></tr></thead>
+          <thead><tr><th style="width: 190px">证书名</th><th>颁发者</th><th style="width: 170px">有效期</th><th style="width: 96px">状态</th><th style="width: 170px">指纹</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
-      <p class="small muted" style="margin-top: 10px">共 ${data.uniqueCount ?? certificates.length} 张唯一证书，展示最近签发的 ${certificates.length} 张。</p>
+      <p class="small muted" style="margin-top: 10px">
+        共 ${data.uniqueCount ?? certificates.length} 张唯一证书，展示最近签发的 ${certificates.length} 张。
+        ${data.manualUrl ? `· <a href="${esc(data.manualUrl)}" rel="noopener">在 crt.sh 查看原始记录</a>` : ""}
+      </p>
     `;
   }
 
@@ -84,14 +103,26 @@ import Layout from "../layouts/Layout.astro";
     results.innerHTML = "";
 
     try {
-      const data = await getJson<CertResponse>(`/api/cert?q=${encodeURIComponent(domain)}`, { timeoutMs: 20000 });
-      if (!data.ok) throw new Error(data.error ?? "查询失败");
-      statusLine.innerHTML = `<span class="mono">${esc(data.query)}</span> · ${data.certificates?.length ?? 0} 张证书 · 来源：${esc(
-        data.source ?? "crt.sh",
-      )}`;
+      const data = await getJson<CertResponse>(`/api/cert?q=${encodeURIComponent(domain)}`, { timeoutMs: 35000 });
+      if (!data.ok) {
+        statusLine.textContent = `查询失败：${data.error ?? "未知错误"}`;
+        results.className = "";
+        results.innerHTML = errorPanel(data.error ?? "查询失败", data.hint, data.manualUrl);
+        return;
+      }
+      const elapsed = typeof data.elapsedMs === "number" ? ` · ${data.elapsedMs} ms` : "";
+      statusLine.innerHTML = `<span class="mono">${esc(data.query)}</span> · ${data.shown ?? 0} 张 · ${
+        data.source ? esc(data.source) : "CT 日志"
+      }${elapsed}`;
       render(data);
     } catch (error) {
       statusLine.textContent = `查询失败：${error instanceof Error ? error.message : "未知错误"}`;
+      results.className = "";
+      results.innerHTML = errorPanel(
+        error instanceof Error ? error.message : "未知错误",
+        "请求没有在 35 秒内返回，可能是上游 CT 日志服务过载。",
+        `https://crt.sh/?q=${encodeURIComponent(domain)}`,
+      );
     }
   });
 

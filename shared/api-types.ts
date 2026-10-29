@@ -146,8 +146,9 @@ export interface CertEntry {
   notBefore: string | null;
   notAfter: string | null;
   expired: boolean | null;
-  serialNumber: string | null;
-  entryTimestamp: string | null;
+  revoked: boolean | null;
+  /** SHA-256 of the certificate (Cert Spotter) or the serial number (crt.sh). */
+  fingerprint: string | null;
 }
 
 export interface CertResponse {
@@ -158,6 +159,9 @@ export interface CertResponse {
   certificates?: CertEntry[];
   source?: string;
   note?: string;
+  hint?: string | null;
+  manualUrl?: string;
+  elapsedMs?: number;
   error?: string;
 }
 

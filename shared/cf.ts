@@ -42,5 +42,6 @@ export type PagesHandler<E = Record<string, string | undefined>> = (
 
 export type PagesEnv = {
   IPINFO_TOKEN?: string;
+  CERTSPOTTER_TOKEN?: string;
   PROBE_ALLOW_PRIVATE?: string;
 };
