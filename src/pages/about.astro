@@ -1,0 +1,60 @@
+---
+import Layout from "../layouts/Layout.astro";
+---
+
+<Layout title="关于与隐私" description="net-tools 的工作方式、数据来源、隐私承诺与能力边界。">
+  <section class="page-head">
+    <h1>关于与隐私</h1>
+    <p class="lede">一个尽量安静的网络工具箱：不记录 IP、不投放广告、不接入第三方分析。</p>
+  </section>
+
+  <section class="card">
+    <div class="card-title"><h2>我们怎么处理你的数据</h2></div>
+    <dl class="kv kv--wide">
+      <dt>访问日志</dt>
+      <dd>不记录访问者 IP，不写自定义日志，不使用第三方统计或埋点。</dd>
+      <dt>缓存</dt>
+      <dd>DNS、RDAP、证书、Tor 出口列表的结果会在边缘节点缓存数分钟到数小时，缓存键是查询目标，不包含你的 IP。</dd>
+      <dt>Cookie</dt>
+      <dd>只用 <code>localStorage</code> 记住明暗主题，没有任何跟踪用途的存储。</dd>
+      <dt>私有地址</dt>
+      <dd>输入内网 / 保留地址时，页面只在本地做判定，不会把地址发往任何外部服务。</dd>
+    </dl>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title"><h2>数据来自哪里</h2></div>
+    <div class="table-wrap">
+      <table class="data">
+        <thead><tr><th style="width: 170px">功能</th><th>上游</th></tr></thead>
+        <tbody>
+          <tr><td>出口 IP / 归属 / ASN</td><td>Cloudflare 边缘节点的请求上下文（<code>request.cf</code>），降级时使用 Cloudflare <code>/cdn-cgi/trace</code></td></tr>
+          <tr><td>任意 IP 归属</td><td>ipwho.is，失败时回退 ipinfo.io</td></tr>
+          <tr><td>DNS 记录</td><td>AliDNS、Cloudflare 1.1.1.1、Google 8.8.8.8、AdGuard DNS 的 DoH JSON 接口</td></tr>
+          <tr><td>注册信息</td><td>rdap.org 引导的各区域 RDAP 服务</td></tr>
+          <tr><td>证书</td><td>crt.sh（Certificate Transparency 日志）</td></tr>
+          <tr><td>Tor 出口</td><td>check.torproject.org 的批量出口列表</td></tr>
+          <tr><td>解析器回显</td><td>edns.ip-api.com（ECS 回显）</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title"><h2>能力的边界</h2></div>
+    <ul class="small muted" style="margin: 0; padding-left: 20px; display: grid; gap: 8px">
+      <li>浏览器无法读取操作系统的 DNS、路由表、网卡配置，也无法发起 ICMP；因此没有 ping、traceroute、真实 DNS 泄漏检测。</li>
+      <li>端口探测由 Cloudflare 边缘节点发起，反映边缘到目标的连通性，且部分端口被平台屏蔽。</li>
+      <li>CT 日志不是实时证书链；归属地库的城市级定位存在误差；RDAP 数据可能滞后。</li>
+      <li>ECS 回显与多解析器对比只能给出启发式结论，不能作为安全结论使用。</li>
+    </ul>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title"><h2>技术与反馈</h2></div>
+    <p class="small muted" style="margin: 0">
+      Astro 静态页面 + Cloudflare Pages Functions。源码在
+      <a href="https://github.com/illagerCPR/net-tools" rel="noopener">github.com/illagerCPR/net-tools</a>，问题与建议欢迎提 Issue。
+    </p>
+  </section>
+</Layout>

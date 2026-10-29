@@ -1,0 +1,103 @@
+---
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+  description?: string;
+  active?: string;
+}
+
+const { title, description = "IP 地址、DNS、请求头、端口与证书 —— 一组安静、无广告、不记录 IP 的网络检测工具。" } =
+  Astro.props;
+
+const nav = [
+  { href: "/", label: "概览" },
+  { href: "/ip/", label: "IP 查询" },
+  { href: "/dns/", label: "DNS 查询" },
+  { href: "/leak/", label: "DNS 泄漏" },
+  { href: "/headers/", label: "请求头" },
+  { href: "/port/", label: "端口探测" },
+  { href: "/cert/", label: "证书" },
+  { href: "/about/", label: "关于" },
+];
+
+const current = Astro.url.pathname;
+const isActive = (href: string) => (href === "/" ? current === "/" : current.startsWith(href));
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title} · net-tools</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#0a0e15" />
+    <meta property="og:title" content={`${title} · net-tools`} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script is:inline>
+      (() => {
+        try {
+          const saved = localStorage.getItem("nt-theme");
+          const prefersLight = window.matchMedia("(prefers-color-scheme: light)").matches;
+          document.documentElement.dataset.theme = saved || (prefersLight ? "light" : "dark");
+        } catch {
+          document.documentElement.dataset.theme = "dark";
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="/"><span class="brand-dot"></span>net-tools</a>
+        <nav class="nav" aria-label="主导航">
+          {
+            nav.map((item) => (
+              <a href={item.href} aria-current={isActive(item.href) ? "page" : undefined}>
+                {item.label}
+              </a>
+            ))
+          }
+        </nav>
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换主题">☾</button>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <slot />
+    </main>
+
+    <footer class="site-footer">
+      <div class="inner">
+        <span>net-tools · 不记录 IP、不投放广告、不接入第三方分析</span>
+        <span class="row" style="gap:14px">
+          <a href="/about/">隐私与说明</a>
+          <a href="https://github.com/illagerCPR/net-tools" rel="noopener">源码</a>
+        </span>
+      </div>
+    </footer>
+
+    <script>
+      const toggle = document.getElementById("theme-toggle");
+      const apply = (theme: string) => {
+        document.documentElement.dataset.theme = theme;
+        if (toggle) toggle.textContent = theme === "dark" ? "☀" : "☾";
+        try {
+          localStorage.setItem("nt-theme", theme);
+        } catch {
+          // ignore
+        }
+      };
+      if (toggle) {
+        toggle.textContent = document.documentElement.dataset.theme === "dark" ? "☀" : "☾";
+        toggle.addEventListener("click", () => {
+          const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+          apply(next);
+        });
+      }
+    </script>
+  </body>
+</html>

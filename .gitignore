@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+.wrangler/
+.output/
+.vercel/
+.astro/
+
+# local dev / secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+
+# editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# DSH agent state (memory db etc., must never be committed)
+.dsh-meow/

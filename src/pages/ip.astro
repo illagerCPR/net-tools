@@ -1,0 +1,405 @@
+---
+import Layout from "../layouts/Layout.astro";
+---
+
+<Layout
+  title="IP 地址查询"
+  description="查询任意 IP 的类型判定、归属地、ASN、反向解析、RDAP 注册信息与 Tor 出口状态。"
+>
+  <section class="page-head">
+    <h1>IP 地址查询</h1>
+    <p class="lede">
+      地址判定在本地完成（不产生请求）；归属地、ASN、反向解析与注册信息由边缘节点代为查询。私有地址不会被送到任何外部服务。
+    </p>
+  </section>
+
+  <form class="card row" id="ip-form">
+    <input
+      class="input mono"
+      id="ip-input"
+      type="text"
+      autocomplete="off"
+      spellcheck="false"
+      placeholder="1.1.1.1 或 2400:3200::1"
+      style="flex: 1; min-width: 240px"
+    />
+    <button class="btn" type="submit">查询</button>
+    <button class="btn btn--ghost" type="button" id="ip-mine">我的 IP</button>
+  </form>
+
+  <p class="status-line" id="ip-status" style="margin-top: 12px">输入一个 IP，或点「我的 IP」。</p>
+
+  <div class="grid grid--2" style="margin-top: 18px; align-items: start">
+    <section class="card">
+      <div class="card-title">
+        <h2>地址判定</h2>
+        <span class="badge" id="ip-version">IPv?</span>
+      </div>
+      <div class="row" id="ip-tags" style="margin-bottom: 14px"></div>
+      <dl class="kv" id="ip-basic">
+        <dt>规范化地址</dt>
+        <dd class="mono" id="basic-addr">—</dd>
+        <dt>说明</dt>
+        <dd id="basic-notes" class="muted">—</dd>
+      </dl>
+    </section>
+
+    <section class="card">
+      <div class="card-title">
+        <h2>归属与 ASN</h2>
+        <span class="small muted" id="geo-source"></span>
+      </div>
+      <dl class="kv" id="ip-geo">
+        <dt>国家 / 地区</dt>
+        <dd id="geo-country">—</dd>
+        <dt>城市</dt>
+        <dd id="geo-city">—</dd>
+        <dt>运营商</dt>
+        <dd id="geo-isp">—</dd>
+        <dt>组织</dt>
+        <dd id="geo-org">—</dd>
+        <dt>ASN</dt>
+        <dd class="mono" id="geo-asn">—</dd>
+        <dt>时区</dt>
+        <dd id="geo-tz">—</dd>
+        <dt>坐标</dt>
+        <dd class="mono" id="geo-coord">—</dd>
+      </dl>
+    </section>
+  </div>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>反向解析（PTR）</h2>
+      <span class="small muted" id="ptr-status"></span>
+    </div>
+    <div id="ptr-body" class="empty">等待查询</div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>注册信息（RDAP）</h2>
+      <span class="small muted" id="rdap-status"></span>
+    </div>
+    <div id="rdap-body" class="empty">等待查询</div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>Tor 出口</h2>
+      <span class="small muted" id="tor-status"></span>
+    </div>
+    <div id="tor-body" class="empty">等待查询</div>
+  </section>
+
+  <p class="note" style="margin-top: 20px">
+    归属地数据来自第三方 IP 库，城市级定位存在误差；RDAP 信息来自各区域注册局，可能滞后于最新分配。私有与保留地址不查询外部服务。
+  </p>
+</Layout>
+
+<script>
+  import { classifyIp } from "../../shared/ip";
+  import type { DnsResponse, IpResponse, RdapResponse, TorResponse } from "../../shared/api-types";
+  import { esc, fmtDate, getJson, must, relTime, setText } from "../scripts/lib";
+  import { detectNetwork } from "../scripts/network";
+
+  const form = must<HTMLFormElement>("#ip-form");
+  const input = must<HTMLInputElement>("#ip-input");
+  const statusLine = must("#ip-status");
+
+  const RDAP_EVENT_LABELS: Record<string, string> = {
+    registration: "注册时间",
+    "last changed": "最后变更",
+    expiration: "到期时间",
+    "last update of RDAP database": "RDAP 库更新",
+  };
+
+  function setStatus(html: string): void {
+    statusLine.innerHTML = html;
+  }
+
+  function resetPanels(): void {
+    setText(must("#geo-country"), "—");
+    setText(must("#geo-city"), "—");
+    setText(must("#geo-isp"), "—");
+    setText(must("#geo-org"), "—");
+    setText(must("#geo-asn"), "—");
+    setText(must("#geo-tz"), "—");
+    setText(must("#geo-coord"), "—");
+    setText(must("#geo-source"), "");
+    setText(must("#ptr-body"), "查询中…");
+    setText(must("#ptr-status"), "");
+    setText(must("#rdap-body"), "查询中…");
+    setText(must("#rdap-status"), "");
+    setText(must("#tor-body"), "查询中…");
+    setText(must("#tor-status"), "");
+  }
+
+  function renderClassification(raw: string): boolean {
+    const classification = classifyIp(raw);
+    const versionBadge = must("#ip-version");
+    const tags = must("#ip-tags");
+    if (!classification) {
+      versionBadge.textContent = "无效";
+      versionBadge.className = "badge badge--bad";
+      tags.innerHTML = "";
+      setText(must("#basic-addr"), raw);
+      setText(must("#basic-notes"), "不是合法的 IPv4 / IPv6 地址");
+      return false;
+    }
+
+    versionBadge.textContent = classification.version === 4 ? "IPv4" : "IPv6";
+    versionBadge.className = `badge ${classification.isPublic ? "badge--ok" : "badge--warn"}`;
+
+    tags.innerHTML = [
+      `<span class="tag tag--${classification.scope}">${esc(classification.label)}</span>`,
+      classification.isPublic
+        ? '<span class="tag">可全局路由</span>'
+        : '<span class="tag">不参与公网路由</span>',
+    ].join("");
+
+    setText(must("#basic-addr"), classification.input);
+    setText(must("#basic-notes"), classification.notes.join("；") || "普通公网地址");
+    return true;
+  }
+
+  async function loadGeo(addr: string, isPublic: boolean): Promise<void> {
+    if (!isPublic) {
+      setText(must("#geo-source"), "未查询");
+      setText(must("#geo-country"), "内网 / 保留地址，不查询");
+      must("#ptr-body").textContent = "私有 / 保留地址通常没有公网 PTR 记录";
+      must("#rdap-body").textContent = "私有 / 保留地址没有注册信息";
+      must("#tor-body").textContent = "私有 / 保留地址不可能是 Tor 出口";
+      return;
+    }
+
+    try {
+      const data = await getJson<IpResponse>(`/api/ip?addr=${encodeURIComponent(addr)}`, { timeoutMs: 12000 });
+      const geo = data.geo;
+      setText(must("#geo-source"), geo ? `来源：${data.source ?? "第三方 IP 库"}` : "未获取到归属地");
+      if (geo) {
+        const region = [geo.country, geo.region].filter(Boolean).join(" · ") || "未知";
+        setText(must("#geo-country"), region);
+        setText(must("#geo-city"), geo.city ?? "未知");
+        setText(must("#geo-isp"), geo.isp ?? "未知");
+        setText(must("#geo-org"), geo.org ?? "未知");
+        setText(must("#geo-asn"), geo.asn ?? "未知");
+        setText(must("#geo-tz"), geo.timezone ?? "未知");
+        setText(
+          must("#geo-coord"),
+          geo.latitude !== null && geo.longitude !== null
+            ? `${geo.latitude.toFixed(4)}, ${geo.longitude.toFixed(4)}`
+            : "未知",
+        );
+      }
+    } catch {
+      // Static deploy: no Functions backend, query ipinfo directly (it sends CORS headers).
+      try {
+        const response = await fetch(`https://ipinfo.io/${encodeURIComponent(addr)}/json`, {
+          signal: AbortSignal.timeout(8000),
+        });
+        const body = (await response.json()) as {
+          city?: string;
+          region?: string;
+          country?: string;
+          org?: string;
+          timezone?: string;
+          loc?: string;
+        };
+        setText(must("#geo-source"), "来源：ipinfo.io（降级通道）");
+        setText(must("#geo-country"), [body.country, body.region].filter(Boolean).join(" · ") || "未知");
+        setText(must("#geo-city"), body.city ?? "未知");
+        setText(must("#geo-asn"), body.org?.split(" ")[0] ?? "未知");
+        setText(must("#geo-org"), body.org ?? "未知");
+        setText(must("#geo-tz"), body.timezone ?? "未知");
+        setText(must("#geo-coord"), body.loc?.replace(",", ", ") ?? "未知");
+      } catch {
+        setText(must("#geo-source"), "归属地查询失败");
+      }
+    }
+  }
+
+  async function loadPtr(addr: string, isPublic: boolean): Promise<void> {
+    if (!isPublic) return;
+    const body = must("#ptr-body");
+    const status = must("#ptr-status");
+    try {
+      const data = await getJson<DnsResponse>(
+        `/api/dns?ip=${encodeURIComponent(addr)}&type=PTR&resolvers=ali,cf`,
+        { timeoutMs: 12000 },
+      );
+      const names = [
+        ...new Set(
+          data.resolvers
+            .flatMap((resolver) => resolver.answers)
+            .filter((record) => record.type === 12)
+            .map((record) => record.data),
+        ),
+      ];
+      if (names.length > 0) {
+        body.innerHTML = names.map((name) => `<div class="mono">${esc(name)}</div>`).join("");
+        body.className = "fade-in";
+      } else {
+        const rcodes = data.resolvers.map((resolver) => resolver.rcodeName ?? "错误").join(" / ");
+        body.textContent = `没有 PTR 记录（${rcodes}）`;
+        body.className = "empty";
+      }
+      status.textContent = `解析器：${data.resolvers.map((resolver) => resolver.label).join("、")}`;
+    } catch (error) {
+      body.textContent = `查询失败：${error instanceof Error ? error.message : "未知错误"}`;
+      body.className = "empty";
+    }
+  }
+
+  function renderRdap(data: RdapResponse): string {
+    const rows: string[] = [];
+    const add = (label: string, value: string | null | undefined) => {
+      if (!value) return;
+      rows.push(`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`);
+    };
+
+    add("网络名", data.name);
+    add("句柄", data.handle);
+    if (data.startAddress && data.endAddress) {
+      add("地址段", `${data.startAddress} – ${data.endAddress}`);
+    }
+    add("IP 版本", data.ipVersion);
+    add("国家", data.country);
+    add("类型", data.type);
+    add("上级句柄", data.parentHandle);
+
+    const events = Object.entries(data.events ?? {})
+      .map(([action, date]) => {
+        const label = RDAP_EVENT_LABELS[action] ?? action;
+        return `<dt>${esc(label)}</dt><dd class="mono">${esc(fmtDate(date))}</dd>`;
+      })
+      .join("");
+
+    const status = (data.status ?? []).length
+      ? `<div class="row" style="margin-top:12px">${(data.status ?? [])
+          .map((item) => `<span class="tag">${esc(item)}</span>`)
+          .join("")}</div>`
+      : "";
+
+    const entities = (data.entities ?? [])
+      .map((entity) => {
+        const roles = entity.roles.length ? `（${entity.roles.join(" / ")}）` : "";
+        const name = entity.name ?? entity.org ?? "未署名";
+        const emails = entity.emails.length
+          ? `<div class="small muted mono">${entity.emails.map((email) => esc(email)).join(" · ")}</div>`
+          : "";
+        return `<div style="margin-top:10px"><div>${esc(name)}${esc(roles)}</div>${emails}</div>`;
+      })
+      .join("");
+
+    const notices = [
+      ...(data.remarks ?? []),
+      ...(data.notices ?? []),
+    ]
+      .slice(0, 3)
+      .map(
+        (notice) =>
+          `<details style="margin-top:10px"><summary class="small muted">${esc(notice.title ?? "备注")}</summary><p class="small muted">${esc(notice.description)}</p></details>`,
+      )
+      .join("");
+
+    return `
+      <dl class="kv">${rows.join("")}${events}</dl>
+      ${status}
+      ${entities ? `<div class="divider"></div><div class="small muted">联系人 / 机构</div>${entities}` : ""}
+      ${notices}
+    `;
+  }
+
+  async function loadRdap(addr: string, isPublic: boolean): Promise<void> {
+    if (!isPublic) return;
+    const body = must("#rdap-body");
+    const status = must("#rdap-status");
+    try {
+      const data = await getJson<RdapResponse>(`/api/rdap?ip=${encodeURIComponent(addr)}`, { timeoutMs: 15000 });
+      if (!data.ok) throw new Error(data.error ?? "RDAP 查询失败");
+      body.innerHTML = renderRdap(data);
+      body.className = "fade-in";
+      status.textContent = data.source ?? "";
+    } catch (error) {
+      body.textContent = `查询失败：${error instanceof Error ? error.message : "未知错误"}`;
+      body.className = "empty";
+    }
+  }
+
+  async function loadTor(addr: string, isPublic: boolean): Promise<void> {
+    if (!isPublic) return;
+    const body = must("#tor-body");
+    const status = must("#tor-status");
+    try {
+      const data = await getJson<TorResponse>(`/api/tor?ip=${encodeURIComponent(addr)}`, { timeoutMs: 15000 });
+      if (data.isExit === null) {
+        body.innerHTML = `<span class="badge badge--warn">无法判断</span> <span class="muted small">${esc(
+          data.error ?? "出口列表获取失败",
+        )}</span>`;
+      } else if (data.isExit) {
+        body.innerHTML = `<span class="badge badge--bad">是 Tor 出口节点</span>`;
+      } else {
+        body.innerHTML = `<span class="badge badge--ok">不是 Tor 出口节点</span>`;
+      }
+      status.textContent = data.listSize
+        ? `${data.listSize} 个出口节点 · 列表更新于 ${relTime(data.fetchedAt ?? undefined)}`
+        : "";
+    } catch (error) {
+      body.textContent = `查询失败：${error instanceof Error ? error.message : "未知错误"}`;
+      body.className = "empty";
+    }
+  }
+
+  async function query(raw: string): Promise<void> {
+    const addr = raw.trim();
+    if (!addr) return;
+    history.replaceState(null, "", `/ip/?q=${encodeURIComponent(addr)}`);
+    const classification = classifyIp(addr);
+    setStatus(`<span class="spinner" aria-hidden="true"></span>正在查询 <span class="mono">${esc(addr)}</span>…`);
+    resetPanels();
+    const valid = renderClassification(addr);
+    if (!valid || !classification) {
+      setStatus("请检查地址格式。");
+      return;
+    }
+    await Promise.all([
+      loadGeo(addr, classification.isPublic),
+      loadPtr(addr, classification.isPublic),
+      loadRdap(addr, classification.isPublic),
+      loadTor(addr, classification.isPublic),
+    ]);
+    setStatus(`完成：<span class="mono">${esc(addr)}</span>`);
+  }
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void query(input.value);
+  });
+
+  must("#ip-mine").addEventListener("click", async () => {
+    setStatus('<span class="spinner"></span>正在识别你的 IP…');
+    try {
+      const info = await detectNetwork();
+      input.value = info.ip;
+      await query(info.ip);
+    } catch (error) {
+      setStatus(`识别失败：${error instanceof Error ? error.message : "未知错误"}`);
+    }
+  });
+
+  const initial = new URL(location.href).searchParams.get("q");
+  if (initial) {
+    input.value = initial;
+    void query(initial);
+  } else {
+    void detectNetwork()
+      .then((info) => {
+        input.value = info.ip;
+        return query(info.ip);
+      })
+      .catch(() => {
+        setStatus("输入一个 IP，或点「我的 IP」。");
+      });
+  }
+</script>

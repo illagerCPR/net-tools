@@ -1,0 +1,255 @@
+---
+import Layout from "../layouts/Layout.astro";
+import { DNS_TYPES } from "../../shared/dns";
+import { DEFAULT_RESOLVER_IDS, RESOLVERS } from "../../shared/resolvers";
+
+const examples = [
+  { name: "example.com", type: "A" },
+  { name: "github.com", type: "MX" },
+  { name: "cloudflare.com", type: "NS" },
+  { name: "_dmarc.google.com", type: "TXT" },
+  { name: "example.com", type: "CAA" },
+];
+---
+
+<Layout title="DNS 查询" description="查询 A / AAAA / MX / TXT / CAA 等记录，并对比多个公共解析器的结果。">
+  <section class="page-head">
+    <h1>DNS 记录查询</h1>
+    <p class="lede">
+      同时向多个公共解析器发起 DoH 查询并对比结果。查询经本站的边缘节点转发，因此不受本地网络对公共 DNS 的限制。
+    </p>
+  </section>
+
+  <form class="card stack" id="dns-form" style="gap: 16px">
+    <div class="row" style="align-items: flex-end">
+      <div class="field" style="flex: 1; min-width: 240px">
+        <label for="dns-name">域名</label>
+        <input
+          class="input mono"
+          id="dns-name"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="example.com"
+        />
+      </div>
+      <div class="field" style="width: 150px">
+        <label for="dns-type">记录类型</label>
+        <select class="select mono" id="dns-type">
+          {DNS_TYPES.map((type) => <option value={type}>{type}</option>)}
+        </select>
+      </div>
+      <button class="btn" type="submit">查询</button>
+    </div>
+
+    <div class="field">
+      <span class="field-label">解析器</span>
+      <div class="row" id="dns-resolvers">
+        {
+          RESOLVERS.map((resolver) => (
+            <label class="check" title={resolver.note}>
+              <input type="checkbox" name="resolver" value={resolver.id} checked={(DEFAULT_RESOLVER_IDS as readonly string[]).includes(resolver.id)} />
+              {resolver.label}
+            </label>
+          ))
+        }
+      </div>
+    </div>
+
+    <div class="row small muted" style="gap: 8px">
+      <span>示例：</span>
+      {
+        examples.map((example) => (
+          <button class="btn btn--sm btn--ghost" type="button" data-example={`${example.name}|${example.type}`}>
+            {example.name} · {example.type}
+          </button>
+        ))
+      }
+    </div>
+  </form>
+
+  <p class="status-line" id="dns-status" style="margin-top: 12px">输入域名开始查询。</p>
+  <div class="stack" id="dns-results" style="margin-top: 6px"></div>
+
+  <p class="note" style="margin-top: 20px">
+    结果来自各解析器的 DoH JSON 接口，可能因缓存 TTL 不同而存在短暂差异。DNSSEC 验证状态以「AD」标记表示。
+  </p>
+</Layout>
+
+<script>
+  import type { DnsResponse } from "../../shared/api-types";
+  import { dnsTypeName } from "../../shared/dns";
+  import { esc, fmtMs, getJson, must, toast } from "../scripts/lib";
+
+  const form = must<HTMLFormElement>("#dns-form");
+  const nameInput = must<HTMLInputElement>("#dns-name");
+  const typeSelect = must<HTMLSelectElement>("#dns-type");
+  const statusLine = must("#dns-status");
+  const results = must("#dns-results");
+
+  function setStatus(html: string): void {
+    statusLine.innerHTML = html;
+  }
+
+  function recordTable(records: Array<{ name: string; ttl: number; typeName: string; data: string }>): string {
+    if (records.length === 0) return '<div class="empty">没有记录</div>';
+    return `
+      <div class="table-wrap">
+        <table class="data">
+          <thead><tr><th style="width:70px">TTL</th><th style="width:80px">类型</th><th>数据</th></tr></thead>
+          <tbody>
+            ${records
+              .map(
+                (record) =>
+                  `<tr><td class="mono">${record.ttl}</td><td class="mono">${esc(record.typeName)}</td><td class="mono">${esc(record.data)}</td></tr>`,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function renderCard(resolver: DnsResponse["resolvers"][number]): string {
+    const state = resolver.ok ? "ok" : "bad";
+    const raw = resolver.ok ? (resolver.rcodeName ?? "NOERROR") : (resolver.error ?? "失败");
+    const rcode = raw.length > 34 ? `${raw.slice(0, 34)}…` : raw;
+    const adBadge = resolver.ad ? '<span class="badge badge--ok">DNSSEC · AD</span>' : "";
+    const authority = resolver.authority.length
+      ? `<details style="margin-top: 12px"><summary class="small muted">权威段（${resolver.authority.length} 条）</summary>${recordTable(
+          resolver.authority,
+        )}</details>`
+      : "";
+
+    return `
+      <section class="card">
+        <div class="card-title">
+          <h3>${esc(resolver.label)}</h3>
+          <span class="row small muted" style="gap: 8px">
+            ${adBadge}
+            <span class="badge badge--${state}">${esc(rcode)}</span>
+            <span class="mono">${fmtMs(resolver.elapsedMs)}</span>
+          </span>
+        </div>
+        ${recordTable(resolver.answers)}
+        ${authority}
+      </section>
+    `;
+  }
+
+  function consensus(resolvers: DnsResponse["resolvers"]): string {
+    const successful = resolvers.filter((resolver) => resolver.ok);
+    if (successful.length < 2) return "";
+    const fingerprints = new Set(
+      successful.map((resolver) =>
+        resolver.answers
+          .map((record) => `${record.typeName}:${record.data}`)
+          .sort()
+          .join("|"),
+      ),
+    );
+    return fingerprints.size === 1
+      ? '<span class="badge badge--ok">各解析器结果一致</span>'
+      : '<span class="badge badge--warn">解析器结果不一致</span>';
+  }
+
+  async function run(): Promise<void> {
+    const name = nameInput.value.trim();
+    const type = typeSelect.value;
+    const ids = [...document.querySelectorAll<HTMLInputElement>('input[name="resolver"]:checked')].map(
+      (element) => element.value,
+    );
+
+    if (!name) {
+      toast("请输入域名");
+      return;
+    }
+    if (ids.length === 0) {
+      toast("至少选择一个解析器");
+      return;
+    }
+
+    history.replaceState(null, "", `/dns/?name=${encodeURIComponent(name)}&type=${type}`);
+    setStatus(`<span class="spinner" aria-hidden="true"></span>正在查询 <span class="mono">${esc(name)} ${esc(type)}</span>…`);
+    results.innerHTML = "";
+
+    try {
+      const data = await getJson<DnsResponse>(
+        `/api/dns?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}&resolvers=${ids.join(",")}`,
+        { timeoutMs: 15000 },
+      );
+      if (!data.ok) throw new Error(data.error ?? "查询失败");
+
+      const via =
+        data.via === "edge"
+          ? '<span class="badge">经边缘节点</span>'
+          : "";
+      setStatus(
+        `${via} <span class="mono">${esc(data.name)}</span> · ${esc(data.type)} · ${fmtMs(data.elapsedMs)} ${consensus(
+          data.resolvers,
+        )}`,
+      );
+      results.innerHTML = data.resolvers.map(renderCard).join("");
+      results.classList.add("fade-in");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "查询失败";
+      // Static deploy fallback: hit AliDNS DoH directly (it allows CORS).
+      try {
+        const response = await fetch(
+          `https://dns.alidns.com/resolve?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`,
+          { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(8000) },
+        );
+        const body = (await response.json()) as {
+          Status?: number;
+          AD?: boolean;
+          Answer?: Array<{ TTL?: number; type?: number; data?: string }>;
+        };
+        const rcodeName = body.Status === 0 ? "NOERROR" : body.Status === 3 ? "NXDOMAIN" : `RCODE${body.Status}`;
+        const answers = (body.Answer ?? []).map((record) => ({
+          name,
+          ttl: record.TTL ?? 0,
+          type: Number(record.type ?? 0),
+          typeName: dnsTypeName(Number(record.type ?? 0)),
+          data: record.data ?? "",
+        }));
+        setStatus('<span class="badge badge--warn">边缘接口不可用，已直连阿里 DoH</span>');
+        results.innerHTML = renderCard({
+          id: "ali",
+          label: "阿里 AliDNS（直连）",
+          ok: body.Status === 0,
+          rcodeName,
+          ad: body.AD === true,
+          truncated: false,
+          answers,
+          authority: [],
+          elapsedMs: 0,
+        });
+      } catch {
+        setStatus(`查询失败：${esc(message)}`);
+      }
+    }
+  }
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void run();
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-example]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const [name, type] = (button.dataset.example ?? "").split("|");
+      nameInput.value = name ?? "";
+      typeSelect.value = type ?? "A";
+      void run();
+    });
+  });
+
+  const params = new URL(location.href).searchParams;
+  const initialName = params.get("name");
+  const initialType = params.get("type");
+  if (initialName) nameInput.value = initialName;
+  if (initialType) typeSelect.value = initialType.toUpperCase();
+  if (initialName) {
+    void run();
+  }
+</script>

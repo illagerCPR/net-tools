@@ -1,0 +1,218 @@
+---
+import Layout from "../layouts/Layout.astro";
+---
+
+<Layout title="请求头与 TLS" description="查看服务端实际收到的请求头、连接使用的 HTTP/TLS 版本，以及浏览器暴露的指纹面。">
+  <section class="page-head">
+    <h1>请求头与 TLS</h1>
+    <p class="lede">
+      上面是边缘节点在本页发起的这次 API 请求上真正收到的请求头（不是页面导航本身的头），下面是浏览器愿意公开的指纹面。
+    </p>
+  </section>
+
+  <section class="card">
+    <div class="card-title">
+      <h2>服务端收到的请求头</h2>
+      <span class="small muted" id="headers-status">加载中…</span>
+    </div>
+    <div id="headers-body" class="empty">加载中…</div>
+    <dl class="kv" style="margin-top: 16px">
+      <dt>边缘节点</dt>
+      <dd class="mono" id="cf-colo">—</dd>
+      <dt>HTTP 协议</dt>
+      <dd class="mono" id="cf-http">—</dd>
+      <dt>TLS</dt>
+      <dd class="mono" id="cf-tls">—</dd>
+      <dt>TCP 握手</dt>
+      <dd class="mono" id="cf-rtt">—</dd>
+    </dl>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>浏览器自述</h2>
+      <span class="small muted">均由页面在本地读取</span>
+    </div>
+    <div id="browser-body" class="empty">读取中…</div>
+  </section>
+
+  <p class="note" style="margin-top: 20px">
+    Client Hints 只有在你显式要求时才会被发送，因此某些字段可能是空的；这不代表服务端不支持。本站不会把这些信息写入任何存储。
+  </p>
+</Layout>
+
+<script>
+  import type { HeadersResponse } from "../../shared/api-types";
+  import { esc, fmtMs, getJson, must, setText } from "../scripts/lib";
+
+  interface Row {
+    label: string;
+    value: string;
+  }
+
+  function renderRows(rows: Row[]): string {
+    const filled = rows.filter((row) => row.value !== "");
+    if (filled.length === 0) return '<div class="empty">没有可展示的内容</div>';
+    return `
+      <div class="table-wrap">
+        <table class="data">
+          <tbody>
+            ${filled
+              .map(
+                (row) =>
+                  `<tr><td style="width: 210px; color: var(--muted)">${esc(row.label)}</td><td class="mono">${esc(
+                    row.value,
+                  )}</td></tr>`,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function webglInfo(): Row[] {
+    try {
+      const canvas = document.createElement("canvas");
+      const gl = canvas.getContext("webgl");
+      if (!gl) return [{ label: "WebGL", value: "不可用" }];
+      const debug = gl.getExtension("WEBGL_debug_renderer_info");
+      return [
+        {
+          label: "WebGL 厂商",
+          value: String(debug ? gl.getParameter(debug.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR)),
+        },
+        {
+          label: "WebGL 渲染器",
+          value: String(debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)),
+        },
+      ];
+    } catch {
+      return [];
+    }
+  }
+
+  async function browserRows(): Promise<Row[]> {
+    const nav = navigator as Navigator & {
+      deviceMemory?: number;
+      connection?: { effectiveType?: string; rtt?: number; downlink?: number; saveData?: boolean };
+      userAgentData?: {
+        brands?: Array<{ brand: string; version: string }>;
+        mobile?: boolean;
+        platform?: string;
+        getHighEntropyValues?: (hints: string[]) => Promise<Record<string, unknown>>;
+      };
+      pdfViewerEnabled?: boolean;
+    };
+
+    const rows: Row[] = [
+      { label: "User-Agent", value: nav.userAgent },
+      { label: "平台", value: (nav as { platform?: string }).platform ?? "" },
+      { label: "语言", value: (nav.languages ?? []).join(", ") || nav.language },
+      { label: "时区", value: Intl.DateTimeFormat().resolvedOptions().timeZone },
+      { label: "UTC 偏移", value: `${-new Date().getTimezoneOffset() / 60} 小时` },
+      { label: "屏幕", value: `${screen.width} × ${screen.height} @ ${window.devicePixelRatio}x（${screen.colorDepth} bit）` },
+      { label: "视口", value: `${window.innerWidth} × ${window.innerHeight}` },
+      { label: "CPU 逻辑核心", value: nav.hardwareConcurrency ? String(nav.hardwareConcurrency) : "" },
+      { label: "内存（估计）", value: nav.deviceMemory ? `${nav.deviceMemory} GB` : "" },
+      { label: "Cookie 可用", value: nav.cookieEnabled ? "是" : "否" },
+      { label: "Do Not Track", value: nav.doNotTrack ?? "" },
+      { label: "安全上下文", value: window.isSecureContext ? "是" : "否" },
+      ...webglInfo(),
+    ];
+
+    const uaData = nav.userAgentData;
+    if (uaData) {
+      rows.push({
+        label: "UA 品牌",
+        value: (uaData.brands ?? []).map((brand) => `${brand.brand} ${brand.version}`).join(" / "),
+      });
+      rows.push({ label: "UA 平台", value: uaData.platform ?? "" });
+      rows.push({ label: "移动端", value: uaData.mobile ? "是" : "否" });
+      if (uaData.getHighEntropyValues) {
+        try {
+          const hints = await uaData.getHighEntropyValues([
+            "architecture",
+            "bitness",
+            "model",
+            "platformVersion",
+            "uaFullVersion",
+            "fullVersionList",
+            "wow64",
+          ]);
+          const versions = hints.fullVersionList as Array<{ brand: string; version: string }> | undefined;
+          rows.push({ label: "UA 完整版本", value: String(hints.uaFullVersion ?? "") });
+          rows.push({
+            label: "UA 架构",
+            value: [hints.architecture, hints.bitness ? `${hints.bitness} 位` : ""].filter(Boolean).join(" / "),
+          });
+          rows.push({ label: "UA 平台版本", value: String(hints.platformVersion ?? "") });
+          if (versions) {
+            rows.push({
+              label: "UA 完整品牌列表",
+              value: versions.map((item) => `${item.brand} ${item.version}`).join(" / "),
+            });
+          }
+        } catch {
+          // some browsers reject high entropy hints
+        }
+      }
+    }
+
+    const connection = nav.connection;
+    if (connection) {
+      rows.push({
+        label: "网络类型",
+        value: [connection.effectiveType, connection.rtt ? `${connection.rtt} ms` : "", connection.downlink ? `${connection.downlink} Mbps` : ""]
+          .filter(Boolean)
+          .join(" / "),
+      });
+    }
+
+    try {
+      const estimate = await navigator.storage?.estimate?.();
+      if (estimate?.quota) {
+        rows.push({
+          label: "存储配额",
+          value: `${(estimate.quota / 1024 / 1024 / 1024).toFixed(2)} GB（已用 ${(
+            (estimate.usage ?? 0) /
+            1024 /
+            1024
+          ).toFixed(1)} MB）`,
+        });
+      }
+    } catch {
+      // ignore
+    }
+
+    return rows;
+  }
+
+  async function loadRequestHeaders(): Promise<void> {
+    const body = must("#headers-body");
+    const status = must("#headers-status");
+    try {
+      const data = await getJson<HeadersResponse>("/api/headers", { timeoutMs: 10000 });
+      setText(must("#cf-colo"), data.cf.colo ?? "未知");
+      setText(must("#cf-http"), data.cf.httpProtocol ?? "未知");
+      setText(must("#cf-tls"), [data.cf.tlsVersion, data.cf.tlsCipher].filter(Boolean).join(" / ") || "未知");
+      setText(must("#cf-rtt"), data.cf.clientTcpRtt === null ? "未知" : fmtMs(data.cf.clientTcpRtt));
+      status.textContent = `${data.headers.length + data.extraHeaders.length} 个请求头`;
+      body.className = "fade-in";
+      body.innerHTML = renderRows(
+        [...data.headers, ...data.extraHeaders].map((header) => ({ label: header.name, value: header.value })),
+      );
+    } catch {
+      status.textContent = "边缘接口不可用";
+      body.textContent = "未部署 Functions 时无法回显请求头（纯静态部署）。浏览器自述数据仍然可用。";
+      body.className = "empty";
+    }
+  }
+
+  void loadRequestHeaders();
+  void browserRows().then((rows) => {
+    const body = must("#browser-body");
+    body.className = "fade-in";
+    body.innerHTML = renderRows(rows);
+  });
+</script>

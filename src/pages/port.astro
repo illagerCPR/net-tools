@@ -1,0 +1,121 @@
+---
+import Layout from "../layouts/Layout.astro";
+---
+
+<Layout title="TCP 端口探测" description="由本站的 Cloudflare 边缘节点向目标发起 TCP 连接，检查端口是否可达与握手耗时。">
+  <section class="page-head">
+    <h1>TCP 端口探测</h1>
+    <p class="lede">
+      探测由边缘节点发起，测到的是「边缘 → 目标」的连通性，不是你的电脑到目标的连通性。只发起 TCP 握手，不发送任何应用层数据。
+    </p>
+  </section>
+
+  <form class="card stack" id="port-form" style="gap: 16px">
+    <div class="row" style="align-items: flex-end">
+      <div class="field" style="flex: 1; min-width: 220px">
+        <label for="port-host">目标主机</label>
+        <input class="input mono" id="port-host" type="text" autocomplete="off" spellcheck="false" placeholder="example.com" />
+      </div>
+      <div class="field" style="flex: 1; min-width: 200px">
+        <label for="port-ports">端口（逗号分隔，最多 8 个）</label>
+        <input class="input mono" id="port-ports" type="text" autocomplete="off" spellcheck="false" value="80,443,22,8080" />
+      </div>
+      <div class="field" style="width: 150px">
+        <label for="port-timeout">超时</label>
+        <select class="select" id="port-timeout">
+          <option value="1500">1.5 秒</option>
+          <option value="3000" selected>3 秒</option>
+          <option value="5000">5 秒</option>
+        </select>
+      </div>
+      <button class="btn" type="submit">探测</button>
+    </div>
+    <p class="small muted" style="margin: 0">
+      为防滥用，仅允许公网域名或公网 IP，单次最多 8 个端口。内网、保留地址与 <code>.local</code> / <code>.internal</code> 等私有后缀会被拒绝。
+    </p>
+  </form>
+
+  <p class="status-line" id="port-status" style="margin-top: 12px">输入目标后开始探测。</p>
+  <div id="port-results" style="margin-top: 12px"></div>
+
+  <p class="note" style="margin-top: 20px">
+    Cloudflare 会屏蔽部分出站端口（例如邮件端口），因此这些端口上的失败并不代表目标真的关闭。放行全部端口的探测需要自建服务器。
+  </p>
+</Layout>
+
+<script>
+  import type { PortResponse } from "../../shared/api-types";
+  import { esc, fmtMs, getJson, must } from "../scripts/lib";
+
+  const form = must<HTMLFormElement>("#port-form");
+  const hostInput = must<HTMLInputElement>("#port-host");
+  const portsInput = must<HTMLInputElement>("#port-ports");
+  const timeoutSelect = must<HTMLSelectElement>("#port-timeout");
+  const statusLine = must("#port-status");
+  const results = must("#port-results");
+
+  const STATE_LABEL: Record<string, { text: string; level: "ok" | "bad" | "warn" | "neutral" }> = {
+    open: { text: "开放", level: "ok" },
+    closed: { text: "关闭 / 拒绝", level: "bad" },
+    timeout: { text: "超时", level: "warn" },
+    error: { text: "错误", level: "warn" },
+  };
+
+  function render(data: PortResponse): void {
+    const rows = data.results
+      .map((result) => {
+        const state = STATE_LABEL[result.state] ?? { text: result.state, level: "neutral" as const };
+        return `
+          <tr>
+            <td class="mono">${result.port}</td>
+            <td><span class="badge badge--${state.level === "neutral" ? "" : state.level}">${esc(state.text)}</span></td>
+            <td class="mono">${fmtMs(result.elapsedMs)}</td>
+            <td class="mono muted small">${esc(result.remoteAddress ?? result.error ?? "—")}</td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    results.className = "fade-in";
+    results.innerHTML = `
+      <div class="table-wrap">
+        <table class="data">
+          <thead><tr><th style="width: 90px">端口</th><th style="width: 130px">状态</th><th style="width: 110px">耗时</th><th>备注</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const host = hostInput.value.trim();
+    const ports = portsInput.value.trim();
+    if (!host || !ports) {
+      statusLine.textContent = "请填写目标主机与端口。";
+      return;
+    }
+    statusLine.innerHTML = `<span class="spinner" aria-hidden="true"></span>正在探测 <span class="mono">${esc(host)}</span>…`;
+    results.innerHTML = "";
+
+    try {
+      const data = await getJson<PortResponse>(`/api/port?host=${encodeURIComponent(host)}&ports=${encodeURIComponent(ports)}&timeout=${timeoutSelect.value}`, {
+        timeoutMs: 20000,
+      });
+      const open = data.results.filter((result) => result.state === "open").length;
+      statusLine.innerHTML = `<span class="mono">${esc(data.host)}</span> · ${data.results.length} 个端口 · ${open} 个开放 · ${fmtMs(
+        data.elapsedMs,
+      )}`;
+      render(data);
+    } catch (error) {
+      statusLine.textContent = `探测失败：${error instanceof Error ? error.message : "未知错误"}`;
+    }
+  });
+
+  const query = new URL(location.href).searchParams;
+  const initialHost = query.get("host");
+  if (initialHost) {
+    hostInput.value = initialHost;
+    form.requestSubmit();
+  }
+</script>

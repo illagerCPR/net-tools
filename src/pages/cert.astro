@@ -1,0 +1,103 @@
+---
+import Layout from "../layouts/Layout.astro";
+---
+
+<Layout title="证书历史" description="查询 Certificate Transparency 日志中某个域名签发过的证书。">
+  <section class="page-head">
+    <h1>证书历史（CT 日志）</h1>
+    <p class="lede">
+      这里查的是公开的 Certificate Transparency 日志：某个域名历史上签发过哪些证书、由谁签发、何时到期。它不等于当前服务端真正下发的证书链。
+    </p>
+  </section>
+
+  <form class="card row" id="cert-form">
+    <div class="field" style="flex: 1; min-width: 240px">
+      <label for="cert-domain">域名</label>
+      <input class="input mono" id="cert-domain" type="text" autocomplete="off" spellcheck="false" placeholder="example.com" />
+    </div>
+    <button class="btn" type="submit">查询</button>
+  </form>
+
+  <p class="status-line" id="cert-status" style="margin-top: 12px">输入域名开始查询。</p>
+  <div id="cert-results" style="margin-top: 12px"></div>
+
+  <p class="note note--warn" style="margin-top: 20px">
+    如果域名从未使用过公开 CA 证书（例如只在内网使用自签证书），这里会查不到结果。CT 日志通常有几分钟到数小时的延迟。
+  </p>
+</Layout>
+
+<script>
+  import type { CertResponse } from "../../shared/api-types";
+  import { esc, fmtDate, getJson, must } from "../scripts/lib";
+
+  const form = must<HTMLFormElement>("#cert-form");
+  const input = must<HTMLInputElement>("#cert-domain");
+  const statusLine = must("#cert-status");
+  const results = must("#cert-results");
+
+  function render(data: CertResponse): void {
+    const certificates = data.certificates ?? [];
+    if (certificates.length === 0) {
+      results.className = "empty";
+      results.textContent = "没有查到证书记录。";
+      return;
+    }
+
+    const rows = certificates
+      .map((certificate) => {
+        const state =
+          certificate.expired === null
+            ? '<span class="badge">未知</span>'
+            : certificate.expired
+              ? '<span class="badge badge--bad">已过期</span>'
+              : '<span class="badge badge--ok">有效期内</span>';
+        return `
+          <tr>
+            <td class="mono">${esc(certificate.commonName ?? "—")}</td>
+            <td class="small">${esc(certificate.issuer ?? "—")}</td>
+            <td class="mono small">${esc(fmtDate(certificate.notBefore))}<br>${esc(fmtDate(certificate.notAfter))}</td>
+            <td>${state}</td>
+            <td class="mono small muted">${esc(certificate.serialNumber ?? "—")}</td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    results.className = "fade-in";
+    results.innerHTML = `
+      <div class="table-wrap">
+        <table class="data">
+          <thead><tr><th style="width: 190px">证书名</th><th>颁发者</th><th style="width: 170px">有效期</th><th style="width: 96px">状态</th><th style="width: 170px">序列号</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <p class="small muted" style="margin-top: 10px">共 ${data.uniqueCount ?? certificates.length} 张唯一证书，展示最近签发的 ${certificates.length} 张。</p>
+    `;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const domain = input.value.trim();
+    if (!domain) return;
+    history.replaceState(null, "", `/cert/?q=${encodeURIComponent(domain)}`);
+    statusLine.innerHTML = `<span class="spinner" aria-hidden="true"></span>正在查询 <span class="mono">${esc(domain)}</span> 的 CT 日志…`;
+    results.innerHTML = "";
+
+    try {
+      const data = await getJson<CertResponse>(`/api/cert?q=${encodeURIComponent(domain)}`, { timeoutMs: 20000 });
+      if (!data.ok) throw new Error(data.error ?? "查询失败");
+      statusLine.innerHTML = `<span class="mono">${esc(data.query)}</span> · ${data.certificates?.length ?? 0} 张证书 · 来源：${esc(
+        data.source ?? "crt.sh",
+      )}`;
+      render(data);
+    } catch (error) {
+      statusLine.textContent = `查询失败：${error instanceof Error ? error.message : "未知错误"}`;
+    }
+  });
+
+  const initial = new URL(location.href).searchParams.get("q");
+  if (initial) {
+    input.value = initial;
+    form.requestSubmit();
+  }
+</script>

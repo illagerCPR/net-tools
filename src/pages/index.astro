@@ -1,0 +1,167 @@
+---
+import Layout from "../layouts/Layout.astro";
+
+const tools = [
+  { href: "/ip/", title: "IP 地址查询", desc: "公网 IP 的归属、ASN、反向解析与注册信息（RDAP）" },
+  { href: "/dns/", title: "DNS 记录查询", desc: "A / AAAA / MX / TXT / CAA…，多解析器并行对比" },
+  { href: "/leak/", title: "DNS 泄漏检测", desc: "看看出口、解析器与浏览器信号之间是否自洽" },
+  { href: "/headers/", title: "请求头与 TLS", desc: "服务端看到的请求头，以及连接使用的协议版本" },
+  { href: "/port/", title: "TCP 端口探测", desc: "由边缘节点发起，检查目标端口的连通性与握手耗时" },
+  { href: "/cert/", title: "证书历史", desc: "查 Certificate Transparency 日志里签发过的证书" },
+];
+---
+
+<Layout
+  title="网络工具箱"
+  description="查看我的公网 IP、DNS 解析、请求头、端口连通性与证书历史。无广告、不记录 IP。"
+>
+  <section class="hero">
+    <span class="eyebrow">NETWORK TOOLKIT</span>
+    <h1>看清你所在的网络</h1>
+    <p class="lede">
+      出口 IP、DNS 解析、请求头、端口与证书——一组安静的工具。所有查询只在当下发生，不写日志、不落库、不投放广告。
+    </p>
+  </section>
+
+  <section class="card" style="margin-top: 24px">
+    <div class="card-title">
+      <h2>我的网络</h2>
+      <span class="status-line" id="me-status"><span class="spinner" aria-hidden="true"></span>正在识别…</span>
+    </div>
+    <div class="grid grid--2" style="align-items: start">
+      <div class="ip-hero">
+        <span class="field-label">首选地址</span>
+        <span class="ip-value" id="ip-main">—</span>
+        <div class="row">
+          <button class="btn btn--sm btn--ghost" id="copy-ip" type="button">复制</button>
+          <a class="btn btn--sm btn--ghost" id="detail-link" href="/ip/">更多信息</a>
+        </div>
+        <div class="ip-meta" id="ip-v6">IPv6：检测中…</div>
+      </div>
+      <dl class="kv">
+        <dt>归属地</dt>
+        <dd id="me-geo">—</dd>
+        <dt>运营商 / 组织</dt>
+        <dd id="me-org">—</dd>
+        <dt>ASN</dt>
+        <dd class="mono" id="me-asn">—</dd>
+        <dt>时区</dt>
+        <dd id="me-tz">—</dd>
+        <dt>边缘节点</dt>
+        <dd class="mono" id="me-colo">—</dd>
+        <dt>协议 / TLS</dt>
+        <dd class="mono" id="me-proto">—</dd>
+        <dt>TCP 握手</dt>
+        <dd class="mono" id="me-rtt">—</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>快捷查询</h2>
+      <span class="small muted">自动判断 IP 或域名</span>
+    </div>
+    <form class="row" id="quick-form">
+      <input
+        class="input mono"
+        id="quick-input"
+        type="text"
+        inputmode="url"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="8.8.8.8 或 example.com"
+        style="flex: 1; min-width: 220px"
+      />
+      <button class="btn" type="submit">查询</button>
+    </form>
+  </section>
+
+  <section style="margin-top: 30px">
+    <h2 style="margin-bottom: 14px">全部工具</h2>
+    <div class="tool-grid">
+      {
+        tools.map((tool) => (
+          <a class="tool-card" href={tool.href}>
+            <strong>{tool.title}</strong>
+            <span>{tool.desc}</span>
+          </a>
+        ))
+      }
+    </div>
+  </section>
+
+  <p class="note" style="margin-top: 24px">
+    本站不记录访问者 IP。识别 IP 依赖 Cloudflare 边缘节点的请求上下文，仅用于本次响应；DNS 与证书查询的结果会在边缘缓存数分钟到数小时。
+  </p>
+</Layout>
+
+<script>
+  import { copyText, fmtMs, isIpLike, must, setText } from "../scripts/lib";
+  import { detectIpv6, detectNetwork } from "../scripts/network";
+
+  const status = must("#me-status");
+  const ipMain = must("#ip-main");
+  const copyButton = must<HTMLButtonElement>("#copy-ip");
+  const detailLink = must<HTMLAnchorElement>("#detail-link");
+  let currentIp = "";
+
+  function setStatus(text: string, filtered = false): void {
+    status.innerHTML = filtered
+      ? `<span class="badge badge--warn">备用通道</span>${text}`
+      : text;
+  }
+
+  function render(info: Awaited<ReturnType<typeof detectNetwork>>): void {
+    currentIp = info.ip;
+    setText(ipMain, info.ip);
+    if (info.ip.includes(":")) ipMain.classList.add("ip-value--v6");
+    detailLink.href = `/ip/?q=${encodeURIComponent(info.ip)}`;
+
+    const geoParts = [info.country, info.region, info.city].filter(
+      (part): part is string => Boolean(part && part !== ""),
+    );
+    setText(must("#me-geo"), geoParts.join(" · ") || "未知");
+    setText(must("#me-org"), info.asOrganization || "未知");
+    setText(must("#me-asn"), info.asn || "未知");
+    setText(must("#me-tz"), info.timezone || "未知");
+    setText(must("#me-colo"), info.colo || "未知");
+    const protocol = [info.http, info.tls].filter(Boolean).join(" / ");
+    setText(must("#me-proto"), protocol || "未知");
+    setText(must("#me-rtt"), info.clientTcpRtt === null ? "未知" : fmtMs(info.clientTcpRtt));
+
+    setStatus(info.source === "edge" ? "已通过本站边缘节点识别" : "已通过备用通道识别（边缘扩展信息不可用）");
+  }
+
+  async function run(): Promise<void> {
+    try {
+      const info = await detectNetwork();
+      render(info);
+      if (!info.ip.includes(":")) {
+        const ipv6 = await detectIpv6();
+        setText(must("#ip-v6"), ipv6 ? `IPv6：${ipv6}` : "IPv6：未检测到（可能未启用或有过滤）");
+      } else {
+        setText(must("#ip-v6"), "IPv6：当前会话已使用 IPv6");
+      }
+    } catch (error) {
+      setText(ipMain, "识别失败");
+      setStatus(error instanceof Error ? error.message : "未知错误", true);
+    }
+  }
+
+  copyButton.addEventListener("click", () => {
+    if (currentIp) void copyText(currentIp);
+  });
+
+  must<HTMLFormElement>("#quick-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = must<HTMLInputElement>("#quick-input");
+    const value = input.value.trim();
+    if (!value) return;
+    window.location.href = isIpLike(value)
+      ? `/ip/?q=${encodeURIComponent(value)}`
+      : `/dns/?name=${encodeURIComponent(value)}`;
+  });
+
+  void run();
+</script>

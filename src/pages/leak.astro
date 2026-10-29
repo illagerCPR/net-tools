@@ -1,0 +1,479 @@
+---
+import Layout from "../layouts/Layout.astro";
+---
+
+<Layout
+  title="DNS 泄漏检测"
+  description="用启发式信号检查：出口与解析器是否自洽、WebRTC 是否暴露地址、多个解析器给出的结果是否一致。"
+>
+  <section class="page-head">
+    <h1>DNS 泄漏检测</h1>
+    <p class="lede">
+      浏览器永远读不到你系统里配置的 DNS 服务器，所以这里做的是「启发式」检查：把出口地址、解析器回显、浏览器时区/语言、WebRTC 与多解析器结果放在一起，看它们是否自洽。
+    </p>
+  </section>
+
+  <section class="card">
+    <div class="card-title">
+      <h2>开始</h2>
+      <span class="status-line" id="leak-status">点击右侧按钮开始检测。</span>
+    </div>
+    <div class="row">
+      <button class="btn" id="leak-run" type="button">开始检测</button>
+      <span class="small muted">会向第三方 ECS 回显服务与 Cloudflare STUN 各发一次请求。</span>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>出口</h2>
+      <span class="badge" id="leak-verdict">未检测</span>
+    </div>
+    <dl class="kv">
+      <dt>出口 IP</dt>
+      <dd class="mono" id="exit-ip">—</dd>
+      <dt>国家 / 城市</dt>
+      <dd id="exit-geo">—</dd>
+      <dt>边缘节点</dt>
+      <dd class="mono" id="exit-colo">—</dd>
+      <dt>浏览器时区</dt>
+      <dd class="mono" id="exit-tz">—</dd>
+      <dt>语言</dt>
+      <dd class="mono" id="exit-lang">—</dd>
+    </dl>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>解析器可见性（ECS 回显）</h2>
+      <span class="small muted" id="ecs-source"></span>
+    </div>
+    <div id="ecs-body" class="empty">未检测</div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>一致性检查</h2>
+      <span class="small muted">启发式结论，不能证明是否存在泄漏</span>
+    </div>
+    <div id="checks-body" class="empty">未检测</div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>多解析器对比</h2>
+      <span class="small muted" id="compare-target"></span>
+    </div>
+    <div id="compare-body" class="empty">未检测</div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title">
+      <h2>WebRTC</h2>
+      <span class="small muted" id="webrtc-status"></span>
+    </div>
+    <div id="webrtc-body" class="empty">未检测</div>
+  </section>
+
+  <section class="card" style="margin-top: 18px">
+    <div class="card-title"><h2>为什么只能「大致」</h2></div>
+    <ul class="small muted" style="margin: 0; padding-left: 20px; display: grid; gap: 8px">
+      <li>浏览器没有 API 可以读取操作系统的 DNS 配置，也不允许发起任意 DNS 查询。</li>
+      <li>ECS 回显依赖第三方服务：它看到的是「递归解析器访问它时携带的子网」，在 CDN、CGNAT、代理链路上都会失真。</li>
+      <li>WebRTC 在现代浏览器里通常会被 mDNS 遮蔽，看不到本地地址反而说明隐私保护生效。</li>
+      <li>多解析器结果不一致，可能是缓存 TTL 差异、CDN 就近解析，也可能真的是污染或分流——本工具不区分这几种情况。</li>
+      <li>真正的泄漏检测需要自建权威 DNS 并观察实际查询来源，那是另一套基础设施。</li>
+    </ul>
+  </section>
+</Layout>
+
+<script>
+  import { classifyIp } from "../../shared/ip";
+  import type { DnsResponse } from "../../shared/api-types";
+  import { badge, esc, getJson, must, setText } from "../scripts/lib";
+  import { detectNetwork, type NetInfo } from "../scripts/network";
+
+  interface EcsResponse {
+    dns?: { ip?: string; geo?: string };
+    edns?: { ip?: string; geo?: string };
+  }
+
+  interface Check {
+    level: "ok" | "warn" | "bad" | "neutral";
+    title: string;
+    detail: string;
+  }
+
+  const runButton = must<HTMLButtonElement>("#leak-run");
+  const statusLine = must("#leak-status");
+
+  function setStatus(html: string): void {
+    statusLine.innerHTML = html;
+  }
+
+  function regionName(code: string | null): string | null {
+    if (!code) return null;
+    try {
+      return new Intl.DisplayNames(["en"], { type: "region" }).of(code) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  function prefixCountry(geo: string | null | undefined): string | null {
+    if (!geo) return null;
+    const [first] = geo.split(" - ");
+    return first?.trim() ?? null;
+  }
+
+  async function loadEcs(): Promise<EcsResponse | null> {
+    try {
+      const response = await fetch("https://edns.ip-api.com/json", { signal: AbortSignal.timeout(8000) });
+      if (!response.ok) return null;
+      return (await response.json()) as EcsResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  interface WebrtcResult {
+    supported: boolean;
+    candidates: Array<{ ip: string; type: string; isPrivate: boolean }>;
+  }
+
+  async function checkWebrtc(): Promise<WebrtcResult> {
+    if (typeof RTCPeerConnection === "undefined") return { supported: false, candidates: [] };
+    const peer = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] });
+    const lines: string[] = [];
+    peer.onicecandidate = (event) => {
+      if (event.candidate?.candidate) lines.push(event.candidate.candidate);
+    };
+    try {
+      peer.createDataChannel("probe");
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      await new Promise<void>((resolve) => {
+        const timer = window.setTimeout(resolve, 3000);
+        peer.onicegatheringstatechange = () => {
+          if (peer.iceGatheringState === "complete") {
+            window.clearTimeout(timer);
+            resolve();
+          }
+        };
+      });
+    } catch {
+      return { supported: true, candidates: [] };
+    } finally {
+      peer.close();
+    }
+
+    const candidates: Array<{ ip: string; type: string; isPrivate: boolean }> = [];
+    for (const line of lines) {
+      const parts = line.split(" ");
+      const ip = parts[4];
+      const type = parts[7] ?? "unknown";
+      if (!ip) continue;
+      const classification = classifyIp(ip);
+      candidates.push({
+        ip,
+        type,
+        isPrivate: classification ? !classification.isPublic : false,
+      });
+    }
+    return { supported: true, candidates };
+  }
+
+  async function compareResolvers(): Promise<DnsResponse | null> {
+    try {
+      return await getJson<DnsResponse>("/api/dns?name=www.google.com&type=A&resolvers=ali,cf,google", {
+        timeoutMs: 15000,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  function renderExit(net: NetInfo): void {
+    setText(must("#exit-ip"), net.ip);
+    setText(must("#exit-geo"), [net.country, net.city].filter(Boolean).join(" · ") || "未知");
+    setText(must("#exit-colo"), net.colo ?? "未知");
+    setText(must("#exit-tz"), Intl.DateTimeFormat().resolvedOptions().timeZone);
+    setText(must("#exit-lang"), navigator.languages?.join(", ") || navigator.language || "未知");
+  }
+
+  function renderEcs(ecs: EcsResponse | null): void {
+    const body = must("#ecs-body");
+    const source = must("#ecs-source");
+    if (!ecs) {
+      body.textContent = "ECS 回显服务不可达（可能被网络阻断）";
+      body.className = "empty";
+      source.textContent = "";
+      return;
+    }
+    source.textContent = "来源：edns.ip-api.com";
+    body.className = "fade-in";
+    body.innerHTML = `
+      <div class="table-wrap">
+        <table class="data">
+          <thead><tr><th>观察点</th><th>IP</th><th>归属</th></tr></thead>
+          <tbody>
+            <tr><td>递归解析器</td><td class="mono">${esc(ecs.dns?.ip ?? "—")}</td><td>${esc(ecs.dns?.geo ?? "—")}</td></tr>
+            <tr><td>客户端子网（ECS）</td><td class="mono">${esc(ecs.edns?.ip ?? "—")}</td><td>${esc(ecs.edns?.geo ?? "—")}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted" style="margin-top: 10px">这两行都来自第三方服务的推断，不代表你系统里真实的 DNS 配置。</p>
+    `;
+  }
+
+  function renderChecks(checks: Check[]): void {
+    const body = must("#checks-body");
+    if (checks.length === 0) {
+      body.textContent = "没有可用的检查项";
+      body.className = "empty";
+      return;
+    }
+    body.className = "fade-in";
+    body.innerHTML = checks
+      .map(
+        (check) => `
+        <div class="row" style="align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border)">
+          ${badge(check.level === "neutral" ? "neutral" : check.level, check.level === "ok" ? "OK" : check.level === "warn" ? "注意" : check.level === "bad" ? "异常" : "信息")}
+          <div style="flex: 1; min-width: 0">
+            <div>${esc(check.title)}</div>
+            <div class="small muted">${esc(check.detail)}</div>
+          </div>
+        </div>
+      `,
+      )
+      .join("");
+  }
+
+  function renderVerdict(checks: Check[]): void {
+    const weight = checks.reduce((total, check) => total + (check.level === "bad" ? 2 : check.level === "warn" ? 1 : 0), 0);
+    const node = must("#leak-verdict");
+    if (weight === 0) {
+      node.className = "badge badge--ok";
+      node.textContent = "未发现明显异常";
+    } else if (weight <= 2) {
+      node.className = "badge badge--warn";
+      node.textContent = "存在需要留意的信号";
+    } else {
+      node.className = "badge badge--bad";
+      node.textContent = "多个信号不自洽";
+    }
+  }
+
+  function renderCompare(data: DnsResponse | null): void {
+    const body = must("#compare-body");
+    if (!data) {
+      body.textContent = "边缘接口不可用，跳过（静态部署时该检测依赖 Functions）";
+      body.className = "empty";
+      return;
+    }
+    const target = must("#compare-target");
+    target.textContent = `www.google.com · A · ${data.elapsedMs} ms`;
+    body.className = "fade-in";
+
+    const rows = data.resolvers
+      .map((resolver) => {
+        const answers = resolver.answers
+          .filter((record) => record.type === 1 || record.type === 5)
+          .map((record) => record.data)
+          .join("<br>");
+        const state = resolver.ok ? (resolver.answers.length ? "ok" : "neutral") : "bad";
+        return `
+          <tr>
+            <td>${esc(resolver.label)}</td>
+            <td>${badge(state, resolver.ok ? resolver.rcodeName ?? "NOERROR" : "失败")}</td>
+            <td class="mono">${answers || esc(resolver.error ?? "无记录")}</td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    body.innerHTML = `
+      <div class="table-wrap">
+        <table class="data">
+          <thead><tr><th style="width: 180px">解析器</th><th style="width: 110px">状态</th><th>应答</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function renderWebrtc(result: WebrtcResult, exitIp: string): void {
+    const body = must("#webrtc-body");
+    const status = must("#webrtc-status");
+    if (!result.supported) {
+      body.textContent = "当前浏览器不支持 WebRTC";
+      body.className = "empty";
+      return;
+    }
+    if (result.candidates.length === 0) {
+      status.textContent = "未收集到候选地址";
+      body.textContent = "没有 ICE 候选（可能被网络或浏览器策略拦截）";
+      body.className = "empty";
+      return;
+    }
+
+    const byType = new Map<string, string[]>();
+    for (const candidate of result.candidates) {
+      const list = byType.get(candidate.type) ?? [];
+      list.push(candidate.ip);
+      byType.set(candidate.type, list);
+    }
+
+    const rows = [...byType.entries()]
+      .map(([type, ips]) => {
+        const unique = [...new Set(ips)];
+        return `<tr><td class="mono">${esc(type)}</td><td class="mono">${unique.map((ip) => esc(ip)).join("<br>")}</td></tr>`;
+      })
+      .join("");
+
+    const revealed = result.candidates.filter((candidate) => candidate.isPrivate && !candidate.ip.endsWith(".local"));
+    const publicCandidates = result.candidates.filter(
+      (candidate) => !candidate.isPrivate && candidate.ip !== exitIp && !candidate.ip.endsWith(".local"),
+    );
+
+    body.className = "fade-in";
+    body.innerHTML = `
+      <div class="table-wrap">
+        <table class="data">
+          <thead><tr><th style="width: 120px">候选类型</th><th>地址</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <p class="small muted" style="margin-top: 10px">
+        ${revealed.length ? "本地候选暴露了私有地址。" : "没有暴露私有地址（mDNS 遮蔽可能已生效）。"}
+        ${publicCandidates.length ? `公网候选与出口 IP 不同（${publicCandidates.map((c) => c.ip).join("、")}）。` : ""}
+      </p>
+    `;
+    status.textContent = `${result.candidates.length} 个候选`;
+    status.dataset.revealed = revealed.length > 0 ? "1" : "0";
+    status.dataset.publicMismatch = publicCandidates.length > 0 ? "1" : "0";
+  }
+
+  async function run(): Promise<void> {
+    runButton.disabled = true;
+    setStatus('<span class="spinner" aria-hidden="true"></span>正在检测…');
+    must("#checks-body").textContent = "检测中…";
+    must("#compare-body").textContent = "检测中…";
+    must("#webrtc-body").textContent = "正在收集 ICE 候选…";
+
+    const [netResult, ecs, webrtc, compare] = await Promise.allSettled([
+      detectNetwork(),
+      loadEcs(),
+      checkWebrtc(),
+      compareResolvers(),
+    ]);
+
+    const net = netResult.status === "fulfilled" ? netResult.value : null;
+    const ecsData = ecs.status === "fulfilled" ? ecs.value : null;
+    const webrtcData = webrtc.status === "fulfilled" ? webrtc.value : null;
+    const compareData = compare.status === "fulfilled" ? compare.value : null;
+
+    if (!net) {
+      setStatus("无法识别出口地址，检测中止。");
+      runButton.disabled = false;
+      return;
+    }
+
+    renderExit(net);
+    renderEcs(ecsData);
+    renderCompare(compareData);
+    if (webrtcData) renderWebrtc(webrtcData, net.ip);
+
+    const checks: Check[] = [];
+    const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (net.timezone) {
+      const same = net.timezone === browserTz;
+      checks.push({
+        level: same ? "ok" : "warn",
+        title: "出口时区与浏览器时区",
+        detail: same
+          ? `两者都是 ${browserTz}`
+          : `出口 IP 位于 ${net.timezone}，浏览器是 ${browserTz}：可能使用了代理，或 IP 库定位有偏差`,
+      });
+    }
+
+    const exitCountryName = regionName(net.country);
+    const ecsCountry = prefixCountry(ecsData?.edns?.geo);
+    if (exitCountryName && ecsCountry) {
+      const same = exitCountryName.toLowerCase() === ecsCountry.toLowerCase();
+      checks.push({
+        level: same ? "ok" : "warn",
+        title: "ECS 子网与出口国家",
+        detail: same
+          ? `ECS 显示 ${ecsCountry}，与出口一致`
+          : `ECS 显示 ${ecsCountry}，出口在 ${exitCountryName}：可能是 DNS 分流、代理链路，或 ECS 被 CDN 改写`,
+      });
+    } else if (!ecsData) {
+      checks.push({ level: "neutral", title: "ECS 回显", detail: "服务不可达，跳过该检查" });
+    }
+
+    const langRegion = (navigator.language ?? "").split("-")[1]?.toUpperCase() ?? null;
+    if (langRegion && net.country) {
+      const same = langRegion === net.country;
+      checks.push({
+        level: same ? "ok" : "neutral",
+        title: "浏览器语言与出口国家",
+        detail: same ? `${langRegion} 与出口一致` : `语言区域 ${langRegion}，出口 ${net.country}：很常见，仅作参考`,
+      });
+    }
+
+    if (webrtcData && webrtcData.candidates.length > 0) {
+      const revealed = webrtcData.candidates.some(
+        (candidate) => candidate.isPrivate && !candidate.ip.endsWith(".local"),
+      );
+      const mismatched = webrtcData.candidates.some(
+        (candidate) => !candidate.isPrivate && candidate.ip !== net.ip && !candidate.ip.endsWith(".local"),
+      );
+      checks.push({
+        level: revealed ? "warn" : "ok",
+        title: "WebRTC 本地地址",
+        detail: revealed
+          ? "ICE 候选里出现了私有地址，本地网络信息可能被网页读到"
+          : "未发现私有地址泄露（mDNS 遮蔽生效或没有 host 候选）",
+      });
+      if (mismatched) {
+        checks.push({
+          level: "warn",
+          title: "WebRTC 公网候选与出口不一致",
+          detail: "说明同一台机器存在多条出口路径，常见于代理或双栈环境",
+        });
+      }
+    }
+
+    if (compareData) {
+      const okAnswers = compareData.resolvers.filter((resolver) => resolver.ok);
+      const fingerprints = new Set(
+        okAnswers.map((resolver) =>
+          resolver.answers
+            .map((record) => record.data)
+            .sort()
+            .join("|"),
+        ),
+      );
+      if (okAnswers.length >= 2) {
+        checks.push({
+          level: fingerprints.size === 1 ? "ok" : "warn",
+          title: "多解析器结果",
+          detail:
+            fingerprints.size === 1
+              ? "各解析器对 www.google.com 的应答一致"
+              : "各解析器应答不同：可能是就近解析、缓存差异，也可能是污染",
+        });
+      }
+    }
+
+    renderChecks(checks);
+    renderVerdict(checks);
+    setStatus("检测完成。结论是启发式的，仅供对照。");
+    runButton.disabled = false;
+  }
+
+  runButton.addEventListener("click", () => {
+    void run();
+  });
+</script>

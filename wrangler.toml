@@ -1,0 +1,6 @@
+name = "net-tools"
+compatibility_date = "2026-10-29"
+pages_build_output_dir = "dist"
+
+# Optional: set IPINFO_TOKEN in the Pages dashboard (Settings -> Variables)
+# to raise the ipinfo.io fallback quota.
