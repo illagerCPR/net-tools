@@ -2,6 +2,8 @@
 
 一组安静的网络检测工具：看清你所在的网络。
 
+线上地址：<https://net-tools.illageraris.dpdns.org>
+
 不记录访问者 IP，不投放广告，不接入第三方分析。
 
 ## 功能
