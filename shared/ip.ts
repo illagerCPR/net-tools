@@ -217,6 +217,23 @@ export function isBlockedTarget(input: string): boolean {
   return !classification.isPublic;
 }
 
+const BLOCKED_HOST_SUFFIXES = [".local", ".localhost", ".internal", ".home.arpa", ".lan", ".corp"];
+
+const BLOCKED_HOST_NAMES = new Set([
+  "localhost",
+  "metadata.google.internal",
+  "instance-data",
+  "metadata",
+]);
+
+/** True for hostnames that only resolve on the inside of someone's network. */
+export function isBlockedHostName(input: string): boolean {
+  const host = input.trim().toLowerCase().replace(/\.$/, "");
+  if (!host) return true;
+  if (BLOCKED_HOST_NAMES.has(host)) return true;
+  return BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix));
+}
+
 /** Reverse DNS name (in-addr.arpa / ip6.arpa) for PTR lookups. */
 export function reverseName(input: string): string | null {
   const classification = classifyIp(input);

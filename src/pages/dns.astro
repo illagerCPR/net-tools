@@ -1,7 +1,7 @@
 ---
 import Layout from "../layouts/Layout.astro";
 import { DNS_TYPES } from "../../shared/dns";
-import { DEFAULT_RESOLVER_IDS, RESOLVERS } from "../../shared/resolvers";
+import { DEFAULT_RESOLVER_IDS, MAX_CUSTOM_RESOLVERS, RESOLVERS } from "../../shared/resolvers";
 
 const examples = [
   { name: "example.com", type: "A" },
@@ -12,11 +12,11 @@ const examples = [
 ];
 ---
 
-<Layout title="DNS 查询" description="查询 A / AAAA / MX / TXT / CAA 等记录，并对比多个公共解析器的结果。">
+<Layout title="DNS 查询" description="查询 A / AAAA / MX / TXT / CAA 等记录，并对比多个公共解析器与自定义 DoH 端点的结果。">
   <section class="page-head">
     <h1>DNS 记录查询</h1>
     <p class="lede">
-      同时向多个公共解析器发起 DoH 查询并对比结果。查询经本站的边缘节点转发，因此不受本地网络对公共 DNS 的限制。
+      同时向多个解析器发起 DoH 查询并对比结果，也可以临时加上自己的 DoH 端点。查询经本站的边缘节点转发，因此不受本地网络对公共 DNS 的限制。
     </p>
   </section>
 
@@ -54,6 +54,27 @@ const examples = [
           ))
         }
       </div>
+
+      <div class="custom-doh">
+        <div class="row" style="gap: 8px; align-items: center">
+          <input
+            class="input mono"
+            id="doh-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="自定义 DoH 地址"
+            placeholder="https://dns.example.com/dns-query"
+            style="flex: 1; min-width: 220px"
+          />
+          <button class="btn btn--sm btn--ghost" type="button" id="doh-add">添加自定义 DoH</button>
+        </div>
+        <div class="row" id="doh-list" style="gap: 8px"></div>
+        <p class="small muted" style="margin: 0">
+          只支持返回 JSON 的 DoH 端点（<span class="mono">application/dns-json</span>），最多 {MAX_CUSTOM_RESOLVERS} 个，
+          地址只记在本机浏览器里。查询由本站边缘节点发起，因此局域网 DNS 与 IP:53 都查不到。
+        </p>
+      </div>
     </div>
 
     <div class="row small muted" style="gap: 8px">
@@ -72,23 +93,121 @@ const examples = [
   <div class="stack" id="dns-results" style="margin-top: 6px"></div>
 
   <p class="note" style="margin-top: 20px">
-    结果来自各解析器的 DoH JSON 接口，可能因缓存 TTL 不同而存在短暂差异。DNSSEC 验证状态以「AD」标记表示。
+    结果来自各解析器的 DoH JSON 接口，可能因缓存 TTL 不同而存在短暂差异。DNSSEC 验证状态以「AD」标记表示；自定义端点不做边缘缓存。
   </p>
 </Layout>
 
 <script>
   import type { DnsResponse } from "../../shared/api-types";
   import { dnsTypeName } from "../../shared/dns";
+  import { MAX_CUSTOM_RESOLVERS, parseCustomDohUrl } from "../../shared/resolvers";
   import { esc, fmtMs, getJson, must, toast } from "../scripts/lib";
+
+  const DOH_STORAGE_KEY = "net-tools.doh";
 
   const form = must<HTMLFormElement>("#dns-form");
   const nameInput = must<HTMLInputElement>("#dns-name");
   const typeSelect = must<HTMLSelectElement>("#dns-type");
+  const dohInput = must<HTMLInputElement>("#doh-input");
+  const dohAdd = must<HTMLButtonElement>("#doh-add");
+  const dohList = must<HTMLDivElement>("#doh-list");
   const statusLine = must("#dns-status");
   const results = must("#dns-results");
 
+  let savedDoh = readSavedDoh();
+
   function setStatus(html: string): void {
     statusLine.innerHTML = html;
+  }
+
+  function readSavedDoh(): string[] {
+    try {
+      const raw = localStorage.getItem(DOH_STORAGE_KEY);
+      if (!raw) return [];
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((item): item is string => typeof item === "string").slice(0, MAX_CUSTOM_RESOLVERS);
+    } catch {
+      return [];
+    }
+  }
+
+  function persistDoh(): void {
+    try {
+      localStorage.setItem(DOH_STORAGE_KEY, JSON.stringify(savedDoh));
+    } catch {
+      // 隐私模式或配额满：只影响是否记住地址，不影响本次查询
+    }
+  }
+
+  function hostOf(endpoint: string): string {
+    try {
+      return new URL(endpoint).hostname;
+    } catch {
+      return endpoint;
+    }
+  }
+
+  function renderDoh(): void {
+    dohList.replaceChildren(
+      ...savedDoh.map((endpoint) => {
+        const chip = document.createElement("div");
+        chip.className = "check check--custom";
+
+        const label = document.createElement("label");
+        label.className = "check-label";
+        label.title = endpoint;
+
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.name = "doh";
+        box.value = endpoint;
+        box.checked = true;
+
+        const text = document.createElement("span");
+        text.className = "mono";
+        text.textContent = hostOf(endpoint);
+
+        label.append(box, text);
+
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "chip-x";
+        remove.dataset.remove = endpoint;
+        remove.title = "移除";
+        remove.setAttribute("aria-label", `移除 ${hostOf(endpoint)}`);
+        remove.textContent = "×";
+
+        chip.append(label, remove);
+        return chip;
+      }),
+    );
+  }
+
+  function addDoh(raw: string): boolean {
+    const value = raw.trim();
+    if (!value) {
+      toast("请输入 DoH 地址");
+      return false;
+    }
+    const parsed = parseCustomDohUrl(value);
+    if (!parsed.ok) {
+      toast(parsed.error);
+      return false;
+    }
+    if (savedDoh.includes(parsed.endpoint)) {
+      toast("这个地址已经加过了");
+      return false;
+    }
+    if (savedDoh.length >= MAX_CUSTOM_RESOLVERS) {
+      toast(`最多 ${MAX_CUSTOM_RESOLVERS} 个自定义 DoH`);
+      return false;
+    }
+    savedDoh = [...savedDoh, parsed.endpoint];
+    persistDoh();
+    renderDoh();
+    toast(`已添加 ${parsed.host}`);
+    return true;
   }
 
   function recordTable(records: Array<{ name: string; ttl: number; typeName: string; data: string }>): string {
@@ -114,6 +233,7 @@ const examples = [
     const state = resolver.ok ? "ok" : "bad";
     const raw = resolver.ok ? (resolver.rcodeName ?? "NOERROR") : (resolver.error ?? "失败");
     const rcode = raw.length > 34 ? `${raw.slice(0, 34)}…` : raw;
+    const customBadge = resolver.custom ? '<span class="badge">自定义</span>' : "";
     const adBadge = resolver.ad ? '<span class="badge badge--ok">DNSSEC · AD</span>' : "";
     const authority = resolver.authority.length
       ? `<details style="margin-top: 12px"><summary class="small muted">权威段（${resolver.authority.length} 条）</summary>${recordTable(
@@ -126,6 +246,7 @@ const examples = [
         <div class="card-title">
           <h3>${esc(resolver.label)}</h3>
           <span class="row small muted" style="gap: 8px">
+            ${customBadge}
             ${adBadge}
             <span class="badge badge--${state}">${esc(rcode)}</span>
             <span class="mono">${fmtMs(resolver.elapsedMs)}</span>
@@ -159,13 +280,16 @@ const examples = [
     const ids = [...document.querySelectorAll<HTMLInputElement>('input[name="resolver"]:checked')].map(
       (element) => element.value,
     );
+    const doh = [...document.querySelectorAll<HTMLInputElement>('input[name="doh"]:checked')].map(
+      (element) => element.value,
+    );
 
     if (!name) {
       toast("请输入域名");
       return;
     }
-    if (ids.length === 0) {
-      toast("至少选择一个解析器");
+    if (ids.length === 0 && doh.length === 0) {
+      toast("至少选择一个解析器，或添加自定义 DoH");
       return;
     }
 
@@ -173,11 +297,11 @@ const examples = [
     setStatus(`<span class="spinner" aria-hidden="true"></span>正在查询 <span class="mono">${esc(name)} ${esc(type)}</span>…`);
     results.innerHTML = "";
 
+    const params = new URLSearchParams({ name, type, resolvers: ids.join(",") });
+    for (const endpoint of doh.slice(0, MAX_CUSTOM_RESOLVERS)) params.append("doh", endpoint);
+
     try {
-      const data = await getJson<DnsResponse>(
-        `/api/dns?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}&resolvers=${ids.join(",")}`,
-        { timeoutMs: 15000 },
-      );
+      const data = await getJson<DnsResponse>(`/api/dns?${params.toString()}`, { timeoutMs: 15000 });
       if (!data.ok) throw new Error(data.error ?? "查询失败");
 
       const via =
@@ -212,7 +336,11 @@ const examples = [
           typeName: dnsTypeName(Number(record.type ?? 0)),
           data: record.data ?? "",
         }));
-        setStatus('<span class="badge badge--warn">边缘接口不可用，已直连阿里 DoH</span>');
+        setStatus(
+          doh.length
+            ? '<span class="badge badge--warn">边缘接口不可用，自定义 DoH 无法直连（跨域限制），已退回阿里 DoH</span>'
+            : '<span class="badge badge--warn">边缘接口不可用，已直连阿里 DoH</span>',
+        );
         results.innerHTML = renderCard({
           id: "ali",
           label: "阿里 AliDNS（直连）",
@@ -235,6 +363,25 @@ const examples = [
     void run();
   });
 
+  dohAdd.addEventListener("click", () => {
+    if (addDoh(dohInput.value)) dohInput.value = "";
+  });
+
+  dohInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (addDoh(dohInput.value)) dohInput.value = "";
+  });
+
+  dohList.addEventListener("click", (event) => {
+    const trigger = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>("[data-remove]");
+    const endpoint = trigger?.dataset.remove;
+    if (!endpoint) return;
+    savedDoh = savedDoh.filter((item) => item !== endpoint);
+    persistDoh();
+    renderDoh();
+  });
+
   document.querySelectorAll<HTMLButtonElement>("[data-example]").forEach((button) => {
     button.addEventListener("click", () => {
       const [name, type] = (button.dataset.example ?? "").split("|");
@@ -243,6 +390,8 @@ const examples = [
       void run();
     });
   });
+
+  renderDoh();
 
   const params = new URL(location.href).searchParams;
   const initialName = params.get("name");

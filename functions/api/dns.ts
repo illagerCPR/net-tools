@@ -1,7 +1,14 @@
 import type { PagesHandler } from "../../shared/cf";
 import { isDnsType, normalizeDomain, parseDohJson } from "../../shared/dns";
 import { reverseName } from "../../shared/ip";
-import { DEFAULT_RESOLVER_IDS, RESOLVERS, findResolver, type ResolverDef } from "../../shared/resolvers";
+import {
+  DEFAULT_RESOLVER_IDS,
+  MAX_CUSTOM_RESOLVERS,
+  RESOLVERS,
+  findResolver,
+  parseCustomDohUrl,
+  type ResolverDef,
+} from "../../shared/resolvers";
 import { cached } from "../_lib/cache";
 import { fail, json, messageOf, methodNotAllowed, preflight } from "../_lib/http";
 import { fetchJson } from "../_lib/upstream";
@@ -38,14 +45,39 @@ export const onRequest: PagesHandler = async ({ request }) => {
     .filter((resolver): resolver is ResolverDef => Boolean(resolver))
     .slice(0, RESOLVERS.length);
 
-  if (selected.length === 0) return fail("没有可用的解析器，请检查 resolvers 参数");
+  const customRaw = url.searchParams
+    .getAll("doh")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (customRaw.length > MAX_CUSTOM_RESOLVERS) {
+    return fail(`自定义 DoH 最多 ${MAX_CUSTOM_RESOLVERS} 个`);
+  }
 
-  const cacheKey = `https://cache.net-tools.internal/dns/v1/${type}/${domain}/${selected.map((r) => r.id).join("+")}`;
+  const origin = url.hostname.toLowerCase();
+  const seenEndpoints = new Set<string>();
+  const custom: ResolverDef[] = [];
+  for (const raw of customRaw) {
+    const parsed = parseCustomDohUrl(raw, custom.length);
+    if (!parsed.ok) return fail(`自定义 DoH 不合法：${parsed.error}`);
+    if (seenEndpoints.has(parsed.endpoint)) continue;
+    if (parsed.host === origin || parsed.host.endsWith(`.${origin}`)) {
+      return fail("自定义 DoH 不能指向本站，否则请求会绕回自己");
+    }
+    seenEndpoints.add(parsed.endpoint);
+    custom.push(parsed.resolver);
+  }
 
-  return cached(cacheKey, CACHE_TTL, async () => {
+  const targets = [...selected, ...custom];
+  if (targets.length === 0) return fail("没有可用的解析器，请检查 resolvers / doh 参数");
+
+  // 自定义端点不进边缘缓存：缓存键里塞任意 URL 会无限膨胀，也可能把别人自建端点的结果给第三个人。
+  const useEdgeCache = custom.length === 0;
+  const cacheKey = `https://cache.net-tools.internal/dns/v1/${type}/${domain}/${targets.map((resolver) => resolver.id).join("+")}`;
+
+  const produce = async (): Promise<Response> => {
     const started = Date.now();
     const results = await Promise.all(
-      selected.map(async (resolver) => {
+      targets.map(async (resolver) => {
         const resolverStarted = Date.now();
         try {
           const raw = await fetchJson<unknown>(resolver.url(domain, type), 5000, {
@@ -55,6 +87,7 @@ export const onRequest: PagesHandler = async ({ request }) => {
           return {
             id: resolver.id,
             label: resolver.label,
+            custom: Boolean(resolver.custom),
             ok: parsed.ok,
             rcode: parsed.rcode,
             rcodeName: parsed.rcodeName,
@@ -68,6 +101,7 @@ export const onRequest: PagesHandler = async ({ request }) => {
           return {
             id: resolver.id,
             label: resolver.label,
+            custom: Boolean(resolver.custom),
             ok: false,
             error: messageOf(error),
             answers: [],
@@ -87,7 +121,9 @@ export const onRequest: PagesHandler = async ({ request }) => {
         elapsedMs: Date.now() - started,
         via: "edge",
       },
-      { cors: true, cache: `public, max-age=${CACHE_TTL}` },
+      { cors: true, cache: useEdgeCache ? `public, max-age=${CACHE_TTL}` : "no-store" },
     );
-  });
+  };
+
+  return useEdgeCache ? cached(cacheKey, CACHE_TTL, produce) : produce();
 };

@@ -48,6 +48,8 @@ export interface MeResponse {
 export interface DnsResolverResult {
   id: string;
   label: string;
+  /** Endpoint supplied by the visitor, not one of the built-in resolvers. */
+  custom?: boolean;
   ok: boolean;
   rcode?: number;
   rcodeName?: string;

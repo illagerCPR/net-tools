@@ -1,6 +1,6 @@
 import { connect, type Socket } from "cloudflare:sockets";
 import type { PagesEnv, PagesHandler } from "../../shared/cf";
-import { classifyIp, isBlockedTarget } from "../../shared/ip";
+import { classifyIp, isBlockedHostName, isBlockedTarget } from "../../shared/ip";
 import { fail, json, methodNotAllowed, preflight } from "../_lib/http";
 
 const MAX_PORTS = 8;
@@ -40,9 +40,6 @@ function parsePorts(raw: string): number[] | null {
   return unique.length > 0 && unique.length <= MAX_PORTS ? unique : null;
 }
 
-const BLOCKED_SUFFIXES = [".local", ".localhost", ".internal", ".home.arpa", ".lan", ".corp"];
-const BLOCKED_NAMES = new Set(["localhost", "metadata.google.internal", "instance-data", "metadata"]);
-
 function validHost(raw: string): string | null {
   const host = raw.trim().toLowerCase().replace(/\.$/, "");
   if (!host || host.length > 253) return null;
@@ -50,8 +47,7 @@ function validHost(raw: string): string | null {
   if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$/i.test(host)) {
     return null;
   }
-  if (BLOCKED_NAMES.has(host)) return null;
-  if (BLOCKED_SUFFIXES.some((suffix) => host.endsWith(suffix))) return null;
+  if (isBlockedHostName(host)) return null;
   return host;
 }
 

@@ -26,7 +26,7 @@ tests/                node:test 单元测试（.mjs 直接导入 .ts）
 | --- | --- | --- | --- |
 | `/api/me` | GET | 出口 IP 与 `request.cf` 子集 | 不缓存 |
 | `/api/headers` | GET | 请求头回显 + 连接信息 | 不缓存 |
-| `/api/dns` | GET | 多解析器 DoH 并行查询，`name` 或 `ip`（PTR）+ `type` + `resolvers` | 60s |
+| `/api/dns` | GET | 多解析器 DoH 并行查询，`name` 或 `ip`（PTR）+ `type` + `resolvers` + `doh`（自定义端点，最多 2 个） | 60s；带 `doh` 时不缓存 |
 | `/api/ip` | GET | 任意 IP 的归属与 ASN（ipwho.is → ipinfo.io） | 6h |
 | `/api/rdap` | GET | RDAP 注册信息，`ip` 或 `domain` | 6h |
 | `/api/cert` | GET | crt.sh 的 CT 日志摘要 | 1h |
@@ -48,7 +48,7 @@ pnpm build && pnpm preview   # 完整栈：wrangler pages dev，含 Functions
 ## 测试与检查
 
 ```bash
-pnpm test    # node:test，覆盖 IP 判定、反向域名、DoH JSON 解析、域名校验
+pnpm test    # node:test，覆盖 IP 判定、反向域名、DoH JSON 解析、域名与自定义 DoH 校验
 pnpm check   # astro check（含 functions 与 shared 的类型检查）
 pnpm build
 ```
@@ -59,6 +59,7 @@ pnpm build
 - **`socket.close()` 不 await**：对未打开的 socket 调用 `close()` 可能永不 settle，会拖住整个探测请求；改用 fire-and-forget。
 - **端口探测黑名单**：拒绝私有 / 保留地址、`localhost`、`.local` / `.internal` / `.home.arpa` 等后缀；Workers 本身也到不了内网，属于纵深防御。
 - **不落 IP**：所有缓存键只含查询目标；`/api/me` 与 `/api/headers` 明确 `no-store`。
+- **自定义 DoH**：`parseCustomDohUrl()` 只放行 `https` + 公网主机 + `fetch` 可达端口（443/8443/2053/2083/2087/2096），并拒绝指向本站的地址（防自环）。带自定义端点时跳过边缘缓存：缓存键由任意 URL 拼会把键空间撑爆，也可能把别人自建端点的结果缓存给第三个人。只支持返回 JSON 的 DoH（`application/dns-json`），wire 格式端点会在解析时报「非 JSON 内容」。
 - **CSS 主题**：`data-theme` 在 `<head>` 内联脚本里先落定，避免首屏闪烁；`:root[data-theme="light"] .btn:not(.btn--ghost)` 控制浅色下按钮文字对比度。
 - **依赖构建脚本**：pnpm 11 把 `onlyBuiltDependencies` 移到 `pnpm-workspace.yaml` 的 `allowBuilds`，否则 `pnpm exec` 会因为「Ignored build scripts」直接失败。
 
